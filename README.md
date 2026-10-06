@@ -20,7 +20,7 @@ The main goal is not only to build a dashboard, but to demonstrate the full jour
 ## 🔄 End-to-End Data Pipeline
 
 <p align="center">
-  <img src="assets/university-data-analysis-pipeline.png" alt="University Data Analysis End-to-End Pipeline" width="100%">
+  <img src="https://github.com/Ahmed-Ramadan-Ismail/University-Data-Analysis/blob/main/Pipline.png">
 </p>
 
 ### Pipeline Steps
@@ -368,9 +368,9 @@ The objective is to show how raw university data can be transformed into a struc
 
 **Ahmed Ramadan**
 
-- GitHub: [Add your GitHub profile]
-- LinkedIn: [Add your LinkedIn profile]
-- Email: [Add your email]
+- GitHub: [https://github.com/Ahmed-Ramadan-Ismail/University-Data-Analysis/blob/main/Pipline.png]
+- LinkedIn: [www.linkedin.com/in/ahmed-ramadan-ismail]
+- Email: [ahmedramadan356.5@gmail.com]
 
 ---
 

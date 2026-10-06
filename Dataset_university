@@ -1,0 +1,1527 @@
+/* ============================================================
+   UNIVERSITY DATABASE - SQL SERVER VERSION
+   Target: Microsoft SQL Server 2016+
+   16 tables | Ready for SSMS
+   ============================================================ */
+
+IF DB_ID(N'university') IS NULL
+    EXEC(N'CREATE DATABASE [university]');
+GO
+
+USE university;
+GO
+
+/* ============================================================
+   CLEAN START
+   ============================================================ */
+DROP VIEW IF EXISTS dbo.v_student_gpa;
+DROP VIEW IF EXISTS dbo.v_section_roster;
+DROP VIEW IF EXISTS dbo.v_course_pass_rate;
+DROP VIEW IF EXISTS dbo.v_faculty_workload;
+DROP VIEW IF EXISTS dbo.v_top_scholars;
+DROP VIEW IF EXISTS dbo.v_publication_stats;
+DROP VIEW IF EXISTS dbo.v_prerequisite_tree;
+GO
+
+DROP PROCEDURE IF EXISTS dbo.sp_enroll_student;
+DROP PROCEDURE IF EXISTS dbo.sp_drop_enrollment;
+DROP PROCEDURE IF EXISTS dbo.sp_submit_grade;
+DROP PROCEDURE IF EXISTS dbo.sp_calculate_gpa;
+DROP PROCEDURE IF EXISTS dbo.sp_get_prerequisite_chain;
+DROP PROCEDURE IF EXISTS dbo.sp_search_courses_semantic;
+GO
+
+DROP TRIGGER IF EXISTS dbo.trg_enrollment_capacity;
+DROP TRIGGER IF EXISTS dbo.trg_section_auto_close;
+DROP TRIGGER IF EXISTS dbo.trg_enrollment_audit;
+DROP TRIGGER IF EXISTS dbo.trg_student_audit;
+DROP TRIGGER IF EXISTS dbo.trg_grade_audit;
+GO
+
+/*
+   IMPORTANT: remove ALL foreign keys in dbo before dropping tables.
+   This is required because departments <-> faculty form a circular
+   relationship, and the previous version could leave one of the two
+   tables behind after a failed DROP. It also handles foreign keys left
+   behind by an earlier/partial execution of this script.
+*/
+DECLARE @sql NVARCHAR(MAX) = N'';
+
+SELECT @sql = @sql +
+    N'ALTER TABLE ' + QUOTENAME(SCHEMA_NAME(fk.schema_id)) + N'.' +
+    QUOTENAME(OBJECT_NAME(fk.parent_object_id)) +
+    N' DROP CONSTRAINT ' + QUOTENAME(fk.name) + N';' + CHAR(13) + CHAR(10)
+FROM sys.foreign_keys AS fk
+WHERE fk.schema_id = SCHEMA_ID(N'dbo')
+   OR fk.referenced_object_id IN
+      (
+        SELECT object_id
+        FROM sys.tables
+        WHERE schema_id = SCHEMA_ID(N'dbo')
+      );
+
+IF @sql <> N''
+    EXEC sys.sp_executesql @sql;
+GO
+
+DROP TABLE IF EXISTS dbo.audit_log;
+DROP TABLE IF EXISTS dbo.grade_events;
+DROP TABLE IF EXISTS dbo.project_members;
+DROP TABLE IF EXISTS dbo.publications;
+DROP TABLE IF EXISTS dbo.research_projects;
+DROP TABLE IF EXISTS dbo.student_scholarships;
+DROP TABLE IF EXISTS dbo.enrollments;
+DROP TABLE IF EXISTS dbo.sections;
+DROP TABLE IF EXISTS dbo.course_prerequisites;
+DROP TABLE IF EXISTS dbo.courses;
+DROP TABLE IF EXISTS dbo.students;
+DROP TABLE IF EXISTS dbo.faculty;
+DROP TABLE IF EXISTS dbo.departments;
+DROP TABLE IF EXISTS dbo.scholarships;
+DROP TABLE IF EXISTS dbo.rooms;
+DROP TABLE IF EXISTS dbo.semesters;
+GO
+
+/* ============================================================
+   1. semesters
+   ============================================================ */
+CREATE TABLE dbo.semesters (
+    semester_id     TINYINT IDENTITY(1,1) NOT NULL,
+    term            VARCHAR(20) NOT NULL,
+    academic_year   SMALLINT NOT NULL,
+    name            VARCHAR(20) NOT NULL,
+    start_date      DATE NOT NULL,
+    end_date        DATE NOT NULL,
+    enroll_deadline DATE NOT NULL,
+    is_active       BIT NOT NULL CONSTRAINT DF_semesters_active DEFAULT 0,
+    CONSTRAINT PK_semesters PRIMARY KEY (semester_id),
+    CONSTRAINT UQ_semester UNIQUE (term, academic_year),
+    CONSTRAINT CK_semester_term CHECK (term IN ('Fall','Spring','Summer'))
+);
+GO
+
+/* ============================================================
+   2. rooms
+   ============================================================ */
+CREATE TABLE dbo.rooms (
+    room_id       SMALLINT IDENTITY(1,1) NOT NULL,
+    building      VARCHAR(60) NOT NULL,
+    room_number   VARCHAR(10) NOT NULL,
+    capacity      SMALLINT NOT NULL,
+    room_type     VARCHAR(20) NOT NULL CONSTRAINT DF_rooms_type DEFAULT 'lecture',
+    has_projector BIT NOT NULL CONSTRAINT DF_rooms_projector DEFAULT 1,
+    has_video     BIT NOT NULL CONSTRAINT DF_rooms_video DEFAULT 0,
+    CONSTRAINT PK_rooms PRIMARY KEY (room_id),
+    CONSTRAINT UQ_room UNIQUE (building, room_number),
+    CONSTRAINT CK_room_type CHECK (room_type IN ('lecture','seminar','lab','computer_lab','online')),
+    CONSTRAINT CK_room_capacity CHECK (capacity > 0)
+);
+GO
+
+/* ============================================================
+   3. scholarships
+   ============================================================ */
+CREATE TABLE dbo.scholarships (
+    scholarship_id SMALLINT IDENTITY(1,1) NOT NULL,
+    name           VARCHAR(150) NOT NULL,
+    amount         DECIMAL(10,2) NOT NULL,
+    frequency      VARCHAR(20) NOT NULL CONSTRAINT DF_scholarship_frequency DEFAULT 'annual',
+    eligibility    NVARCHAR(MAX) NULL,
+    is_active      BIT NOT NULL CONSTRAINT DF_scholarship_active DEFAULT 1,
+    CONSTRAINT PK_scholarships PRIMARY KEY (scholarship_id),
+    CONSTRAINT CK_scholarship_frequency CHECK (frequency IN ('one-time','annual','per-semester')),
+    CONSTRAINT CK_scholarship_amount CHECK (amount >= 0),
+    CONSTRAINT CK_scholarship_json CHECK (eligibility IS NULL OR ISJSON(eligibility) = 1)
+);
+GO
+
+/* ============================================================
+   4. departments
+   ============================================================ */
+CREATE TABLE dbo.departments (
+    department_id   TINYINT NOT NULL,
+    parent_id       TINYINT NULL,
+    code            VARCHAR(10) NOT NULL,
+    name            VARCHAR(100) NOT NULL,
+    level           TINYINT NOT NULL CONSTRAINT DF_department_level DEFAULT 1,
+    head_faculty_id SMALLINT NULL,
+    established     SMALLINT NULL,
+    CONSTRAINT PK_departments PRIMARY KEY (department_id),
+    CONSTRAINT UQ_dept_code UNIQUE (code),
+    CONSTRAINT CK_department_level CHECK (level IN (1,2,3))
+);
+GO
+
+ALTER TABLE dbo.departments
+ADD CONSTRAINT FK_dept_parent
+FOREIGN KEY (parent_id) REFERENCES dbo.departments(department_id);
+GO
+
+/* ============================================================
+   5. faculty
+   ============================================================ */
+CREATE TABLE dbo.faculty (
+    faculty_id    SMALLINT IDENTITY(1,1) NOT NULL,
+    department_id TINYINT NOT NULL,
+    first_name    VARCHAR(50) NOT NULL,
+    last_name     VARCHAR(50) NOT NULL,
+    email         VARCHAR(100) NOT NULL,
+    phone         VARCHAR(20) NULL,
+    rank          VARCHAR(30) NOT NULL,
+    hire_date     DATE NOT NULL,
+    office        VARCHAR(50) NULL,
+    office_hours  NVARCHAR(MAX) NULL,
+    bio           NVARCHAR(MAX) NULL,
+    is_active     BIT NOT NULL CONSTRAINT DF_faculty_active DEFAULT 1,
+    CONSTRAINT PK_faculty PRIMARY KEY (faculty_id),
+    CONSTRAINT UQ_faculty_email UNIQUE (email),
+    CONSTRAINT CK_faculty_rank CHECK
+       (rank IN ('Instructor','Assistant Professor','Associate Professor','Professor','Emeritus')),
+    CONSTRAINT CK_faculty_json CHECK (office_hours IS NULL OR ISJSON(office_hours) = 1),
+    CONSTRAINT FK_faculty_dept FOREIGN KEY (department_id)
+       REFERENCES dbo.departments(department_id)
+);
+GO
+
+ALTER TABLE dbo.departments
+ADD CONSTRAINT FK_dept_head
+FOREIGN KEY (head_faculty_id) REFERENCES dbo.faculty(faculty_id);
+GO
+
+/* ============================================================
+   6. students
+   ============================================================ */
+CREATE TABLE dbo.students (
+    student_id       INT IDENTITY(1,1) NOT NULL,
+    department_id    TINYINT NOT NULL,
+    student_number   CHAR(10) NOT NULL,
+    first_name       VARCHAR(50) NOT NULL,
+    last_name        VARCHAR(50) NOT NULL,
+    email            VARCHAR(100) NOT NULL,
+    date_of_birth    DATE NOT NULL,
+    gender           VARCHAR(25) NULL,
+    enrollment_date  DATE NOT NULL,
+    expected_grad    SMALLINT NULL,
+    status           VARCHAR(20) NOT NULL CONSTRAINT DF_students_status DEFAULT 'active',
+    gpa              DECIMAL(4,3) NULL,
+    contacts         NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_students PRIMARY KEY (student_id),
+    CONSTRAINT UQ_student_number UNIQUE (student_number),
+    CONSTRAINT UQ_student_email UNIQUE (email),
+    CONSTRAINT CK_student_gender CHECK
+       (gender IS NULL OR gender IN ('M','F','NB','Other','Prefer not to say')),
+    CONSTRAINT CK_student_status CHECK
+       (status IN ('active','inactive','graduated','suspended','withdrawn')),
+    CONSTRAINT CK_student_gpa CHECK (gpa IS NULL OR (gpa >= 0 AND gpa <= 4)),
+    CONSTRAINT CK_student_json CHECK (contacts IS NULL OR ISJSON(contacts) = 1),
+    CONSTRAINT FK_student_dept FOREIGN KEY (department_id)
+       REFERENCES dbo.departments(department_id)
+);
+GO
+
+/* ============================================================
+   7. courses
+   embedding is NVARCHAR(MAX) for broad SQL Server compatibility.
+   ============================================================ */
+CREATE TABLE dbo.courses (
+    course_id     SMALLINT IDENTITY(1,1) NOT NULL,
+    department_id TINYINT NOT NULL,
+    code          CHAR(10) NOT NULL,
+    title         VARCHAR(150) NOT NULL,
+    credits       TINYINT NOT NULL CONSTRAINT DF_courses_credits DEFAULT 3,
+    level         VARCHAR(20) NOT NULL CONSTRAINT DF_courses_level DEFAULT 'undergraduate',
+    description   NVARCHAR(MAX) NULL,
+    is_active     BIT NOT NULL CONSTRAINT DF_courses_active DEFAULT 1,
+    embedding     NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_courses PRIMARY KEY (course_id),
+    CONSTRAINT UQ_course_code UNIQUE (code),
+    CONSTRAINT CK_course_level CHECK (level IN ('undergraduate','graduate','doctoral')),
+    CONSTRAINT CK_course_credits CHECK (credits BETWEEN 1 AND 10),
+    CONSTRAINT FK_course_dept FOREIGN KEY (department_id)
+       REFERENCES dbo.departments(department_id)
+);
+GO
+
+/* ============================================================
+   8. course_prerequisites
+   ============================================================ */
+CREATE TABLE dbo.course_prerequisites (
+    course_id       SMALLINT NOT NULL,
+    prerequisite_id SMALLINT NOT NULL,
+    is_mandatory    BIT NOT NULL CONSTRAINT DF_prereq_mandatory DEFAULT 1,
+    CONSTRAINT PK_course_prerequisites PRIMARY KEY (course_id, prerequisite_id),
+    CONSTRAINT CK_no_self_prereq CHECK (course_id <> prerequisite_id),
+    CONSTRAINT FK_prereq_course FOREIGN KEY (course_id)
+       REFERENCES dbo.courses(course_id),
+    CONSTRAINT FK_prereq_prereq FOREIGN KEY (prerequisite_id)
+       REFERENCES dbo.courses(course_id)
+);
+GO
+
+/* ============================================================
+   9. sections
+   ============================================================ */
+CREATE TABLE dbo.sections (
+    section_id     INT IDENTITY(1,1) NOT NULL,
+    course_id      SMALLINT NOT NULL,
+    semester_id    TINYINT NOT NULL,
+    faculty_id     SMALLINT NOT NULL,
+    room_id        SMALLINT NULL,
+    section_number TINYINT NOT NULL CONSTRAINT DF_section_number DEFAULT 1,
+    delivery       VARCHAR(20) NOT NULL CONSTRAINT DF_section_delivery DEFAULT 'in-person',
+    max_capacity   SMALLINT NOT NULL CONSTRAINT DF_section_capacity DEFAULT 30,
+    status         VARCHAR(20) NOT NULL CONSTRAINT DF_section_status DEFAULT 'open',
+    schedule       NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_sections PRIMARY KEY (section_id),
+    CONSTRAINT UQ_section UNIQUE (course_id, semester_id, section_number),
+    CONSTRAINT CK_section_delivery CHECK (delivery IN ('in-person','online','hybrid')),
+    CONSTRAINT CK_section_status CHECK (status IN ('open','closed','cancelled','completed')),
+    CONSTRAINT CK_section_capacity CHECK (max_capacity > 0),
+    CONSTRAINT CK_section_json CHECK (schedule IS NULL OR ISJSON(schedule) = 1),
+    CONSTRAINT FK_section_course FOREIGN KEY (course_id) REFERENCES dbo.courses(course_id),
+    CONSTRAINT FK_section_semester FOREIGN KEY (semester_id) REFERENCES dbo.semesters(semester_id),
+    CONSTRAINT FK_section_faculty FOREIGN KEY (faculty_id) REFERENCES dbo.faculty(faculty_id),
+    CONSTRAINT FK_section_room FOREIGN KEY (room_id) REFERENCES dbo.rooms(room_id)
+);
+GO
+
+/* ============================================================
+   10. enrollments
+   ============================================================ */
+CREATE TABLE dbo.enrollments (
+    enrollment_id INT IDENTITY(1,1) NOT NULL,
+    student_id    INT NOT NULL,
+    section_id    INT NOT NULL,
+    enrolled_at   DATETIME2 NOT NULL CONSTRAINT DF_enrollment_date DEFAULT SYSDATETIME(),
+    status        VARCHAR(20) NOT NULL CONSTRAINT DF_enrollment_status DEFAULT 'enrolled',
+    final_grade   CHAR(2) NULL,
+    final_score   DECIMAL(5,2) NULL,
+    CONSTRAINT PK_enrollments PRIMARY KEY (enrollment_id),
+    CONSTRAINT UQ_enrollment UNIQUE (student_id, section_id),
+    CONSTRAINT CK_enrollment_status CHECK (status IN ('enrolled','dropped','completed','failed','incomplete')),
+    CONSTRAINT CK_final_score CHECK (final_score IS NULL OR (final_score >= 0 AND final_score <= 100)),
+    CONSTRAINT FK_enroll_student FOREIGN KEY (student_id) REFERENCES dbo.students(student_id),
+    CONSTRAINT FK_enroll_section FOREIGN KEY (section_id) REFERENCES dbo.sections(section_id)
+);
+GO
+
+/* ============================================================
+   11. student_scholarships
+   ============================================================ */
+CREATE TABLE dbo.student_scholarships (
+    award_id       INT IDENTITY(1,1) NOT NULL,
+    student_id     INT NOT NULL,
+    scholarship_id SMALLINT NOT NULL,
+    awarded_date   DATE NOT NULL,
+    expires_date   DATE NULL,
+    amount_awarded DECIMAL(10,2) NOT NULL,
+    notes          NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_student_scholarships PRIMARY KEY (award_id),
+    CONSTRAINT CK_award_amount CHECK (amount_awarded >= 0),
+    CONSTRAINT FK_award_student FOREIGN KEY (student_id) REFERENCES dbo.students(student_id),
+    CONSTRAINT FK_award_scholarship FOREIGN KEY (scholarship_id) REFERENCES dbo.scholarships(scholarship_id)
+);
+GO
+
+/* ============================================================
+   12. research_projects
+   ============================================================ */
+CREATE TABLE dbo.research_projects (
+    project_id      SMALLINT IDENTITY(1,1) NOT NULL,
+    department_id   TINYINT NOT NULL,
+    lead_faculty_id SMALLINT NOT NULL,
+    title           VARCHAR(200) NOT NULL,
+    abstract        NVARCHAR(MAX) NULL,
+    start_date      DATE NOT NULL,
+    end_date        DATE NULL,
+    status          VARCHAR(20) NOT NULL CONSTRAINT DF_project_status DEFAULT 'proposed',
+    funding         NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_research_projects PRIMARY KEY (project_id),
+    CONSTRAINT CK_project_status CHECK (status IN ('proposed','active','completed','cancelled')),
+    CONSTRAINT CK_project_json CHECK (funding IS NULL OR ISJSON(funding) = 1),
+    CONSTRAINT FK_project_dept FOREIGN KEY (department_id) REFERENCES dbo.departments(department_id),
+    CONSTRAINT FK_project_lead FOREIGN KEY (lead_faculty_id) REFERENCES dbo.faculty(faculty_id)
+);
+GO
+
+/* ============================================================
+   13. publications
+   ============================================================ */
+CREATE TABLE dbo.publications (
+    publication_id INT IDENTITY(1,1) NOT NULL,
+    project_id     SMALLINT NULL,
+    title          VARCHAR(300) NOT NULL,
+    abstract       NVARCHAR(MAX) NULL,
+    pub_year       SMALLINT NOT NULL,
+    venue          VARCHAR(200) NULL,
+    doi            VARCHAR(100) NULL,
+    keywords       VARCHAR(500) NOT NULL CONSTRAINT DF_publication_keywords DEFAULT '',
+    citation_count INT NOT NULL CONSTRAINT DF_publication_citations DEFAULT 0,
+    CONSTRAINT PK_publications PRIMARY KEY (publication_id),
+    CONSTRAINT CK_publication_year CHECK (pub_year BETWEEN 1900 AND 2100),
+    CONSTRAINT CK_publication_citations CHECK (citation_count >= 0),
+    CONSTRAINT FK_pub_project FOREIGN KEY (project_id) REFERENCES dbo.research_projects(project_id)
+);
+GO
+
+CREATE UNIQUE INDEX UX_publications_doi
+ON dbo.publications(doi)
+WHERE doi IS NOT NULL;
+GO
+
+/* ============================================================
+   14. project_members
+   ============================================================ */
+CREATE TABLE dbo.project_members (
+    member_id   INT IDENTITY(1,1) NOT NULL,
+    project_id  SMALLINT NOT NULL,
+    faculty_id  SMALLINT NULL,
+    student_id  INT NULL,
+    role        VARCHAR(30) NOT NULL,
+    joined_date DATE NOT NULL,
+    left_date   DATE NULL,
+    CONSTRAINT PK_project_members PRIMARY KEY (member_id),
+    CONSTRAINT CK_member_identity CHECK (faculty_id IS NOT NULL OR student_id IS NOT NULL),
+    CONSTRAINT CK_member_role CHECK
+       (role IN ('Principal Investigator','Co-Investigator','Research Assistant','Graduate Student','Undergraduate Student')),
+    CONSTRAINT FK_member_project FOREIGN KEY (project_id) REFERENCES dbo.research_projects(project_id),
+    CONSTRAINT FK_member_faculty FOREIGN KEY (faculty_id) REFERENCES dbo.faculty(faculty_id),
+    CONSTRAINT FK_member_student FOREIGN KEY (student_id) REFERENCES dbo.students(student_id)
+);
+GO
+
+/* ============================================================
+   15. grade_events
+   ============================================================ */
+CREATE TABLE dbo.grade_events (
+    event_id      BIGINT IDENTITY(1,1) NOT NULL,
+    enrollment_id INT NOT NULL,
+    item_name     VARCHAR(100) NOT NULL,
+    item_type     VARCHAR(20) NOT NULL,
+    score         DECIMAL(6,2) NOT NULL,
+    max_score     DECIMAL(6,2) NOT NULL CONSTRAINT DF_grade_max DEFAULT 100,
+    weight        DECIMAL(5,4) NOT NULL,
+    graded_at     DATETIME2 NOT NULL,
+    grader_id     SMALLINT NULL,
+    feedback      NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_grade_events PRIMARY KEY (event_id),
+    CONSTRAINT CK_grade_item_type CHECK
+       (item_type IN ('assignment','quiz','midterm','final','project','participation','lab')),
+    CONSTRAINT CK_grade_score CHECK (score >= 0 AND max_score > 0 AND score <= max_score),
+    CONSTRAINT CK_grade_weight CHECK (weight >= 0 AND weight <= 1),
+    CONSTRAINT FK_ge_enrollment FOREIGN KEY (enrollment_id) REFERENCES dbo.enrollments(enrollment_id),
+    CONSTRAINT FK_ge_grader FOREIGN KEY (grader_id) REFERENCES dbo.faculty(faculty_id)
+);
+GO
+
+/* ============================================================
+   16. audit_log
+   ============================================================ */
+CREATE TABLE dbo.audit_log (
+    log_id      BIGINT IDENTITY(1,1) NOT NULL,
+    table_name  VARCHAR(64) NOT NULL,
+    record_id   BIGINT NOT NULL,
+    action      VARCHAR(10) NOT NULL,
+    changed_at  DATETIME2 NOT NULL CONSTRAINT DF_audit_date DEFAULT SYSDATETIME(),
+    changed_by  VARCHAR(100) NULL,
+    old_values  NVARCHAR(MAX) NULL,
+    new_values  NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_audit_log PRIMARY KEY (log_id),
+    CONSTRAINT CK_audit_action CHECK (action IN ('INSERT','UPDATE','DELETE')),
+    CONSTRAINT CK_audit_old_json CHECK (old_values IS NULL OR ISJSON(old_values) = 1),
+    CONSTRAINT CK_audit_new_json CHECK (new_values IS NULL OR ISJSON(new_values) = 1)
+);
+GO
+
+CREATE INDEX IX_audit_table_record ON dbo.audit_log(table_name, record_id);
+CREATE INDEX IX_audit_changed_at ON dbo.audit_log(changed_at);
+CREATE INDEX IX_audit_action ON dbo.audit_log(action);
+GO
+
+/* ============================================================
+   SEED DATA
+   ============================================================ */
+
+INSERT INTO dbo.semesters
+(term, academic_year, name, start_date, end_date, enroll_deadline, is_active)
+VALUES
+('Fall',2020,'Fall 2020','2020-08-31','2020-12-18','2020-08-21',0),
+('Spring',2021,'Spring 2021','2021-01-19','2021-05-14','2021-01-08',0),
+('Summer',2021,'Summer 2021','2021-05-24','2021-08-06','2021-05-14',0),
+('Fall',2021,'Fall 2021','2021-08-30','2021-12-17','2021-08-20',0),
+('Spring',2022,'Spring 2022','2022-01-18','2022-05-13','2022-01-07',0),
+('Summer',2022,'Summer 2022','2022-05-23','2022-08-05','2022-05-13',0),
+('Fall',2022,'Fall 2022','2022-08-29','2022-12-16','2022-08-19',0),
+('Spring',2023,'Spring 2023','2023-01-17','2023-05-12','2023-01-06',0),
+('Summer',2023,'Summer 2023','2023-05-22','2023-08-04','2023-05-12',0),
+('Fall',2023,'Fall 2023','2023-08-28','2023-12-15','2023-08-18',0),
+('Spring',2024,'Spring 2024','2024-01-16','2024-05-10','2024-01-05',0),
+('Summer',2024,'Summer 2024','2024-05-20','2024-08-02','2024-05-10',0),
+('Fall',2024,'Fall 2024','2024-08-26','2024-12-13','2024-08-16',0),
+('Spring',2025,'Spring 2025','2025-01-21','2025-05-16','2025-01-10',0),
+('Summer',2025,'Summer 2025','2025-05-27','2025-08-08','2025-05-16',0),
+('Fall',2025,'Fall 2025','2025-08-25','2025-12-12','2025-08-15',0),
+('Spring',2026,'Spring 2026','2026-01-20','2026-05-15','2026-01-09',0),
+('Summer',2026,'Summer 2026','2026-05-26','2026-08-07','2026-05-15',1),
+('Fall',2026,'Fall 2026','2026-08-31','2026-12-18','2026-08-21',0),
+('Spring',2027,'Spring 2027','2027-01-19','2027-05-14','2027-01-08',0);
+GO
+
+INSERT INTO dbo.rooms
+(building, room_number, capacity, room_type, has_projector, has_video)
+VALUES
+('Hartley Hall','101',120,'lecture',1,1),
+('Hartley Hall','102',120,'lecture',1,1),
+('Hartley Hall','201',80,'lecture',1,0),
+('Hartley Hall','202',80,'lecture',1,0),
+('Hartley Hall','203',60,'seminar',1,0),
+('Hartley Hall','204',60,'seminar',1,0),
+('Hartley Hall','301',40,'seminar',1,0),
+('Hartley Hall','302',40,'seminar',1,0),
+('Hartley Hall','303',30,'seminar',0,0),
+('Hartley Hall','304',30,'seminar',0,0),
+('Maxwell Science','101',200,'lecture',1,1),
+('Maxwell Science','102',150,'lecture',1,1),
+('Maxwell Science','L101',24,'lab',1,0),
+('Maxwell Science','L102',24,'lab',1,0),
+('Maxwell Science','L103',24,'lab',1,0),
+('Maxwell Science','L201',20,'lab',1,0),
+('Maxwell Science','L202',20,'lab',1,0),
+('Maxwell Science','201',60,'seminar',1,0),
+('Maxwell Science','202',60,'seminar',1,0),
+('Maxwell Science','301',40,'seminar',1,0),
+('Briggs Computing','A100',40,'computer_lab',1,1),
+('Briggs Computing','A101',40,'computer_lab',1,1),
+('Briggs Computing','A102',40,'computer_lab',1,0),
+('Briggs Computing','A103',30,'computer_lab',1,0),
+('Briggs Computing','B100',30,'computer_lab',1,0),
+('Briggs Computing','B101',25,'computer_lab',1,0),
+('Briggs Computing','B200',20,'computer_lab',1,0),
+('Ellsworth Hall','101',100,'lecture',1,0),
+('Ellsworth Hall','102',80,'lecture',1,0),
+('Ellsworth Hall','201',35,'seminar',1,0),
+('Ellsworth Hall','202',35,'seminar',1,0),
+('Ellsworth Hall','203',35,'seminar',0,0),
+('Ellsworth Hall','301',25,'seminar',0,0),
+('Ellsworth Hall','302',25,'seminar',0,0),
+('Westbrook Business','101',150,'lecture',1,1),
+('Westbrook Business','102',100,'lecture',1,1),
+('Westbrook Business','201',60,'seminar',1,0),
+('Westbrook Business','202',60,'seminar',1,0),
+('Westbrook Business','301',40,'seminar',1,0),
+('Westbrook Business','302',40,'seminar',1,0),
+('Westbrook Business','L101',30,'computer_lab',1,0),
+('Prentiss Medical','101',180,'lecture',1,1),
+('Prentiss Medical','L101',16,'lab',1,0),
+('Prentiss Medical','L102',16,'lab',1,0),
+('Prentiss Medical','L103',16,'lab',1,0),
+('Prentiss Medical','L201',12,'lab',1,0),
+('Prentiss Medical','201',60,'seminar',1,0),
+('Online','VIRTUAL',500,'online',0,0);
+GO
+
+INSERT INTO dbo.scholarships(name,amount,frequency,eligibility,is_active)
+VALUES
+('Presidential Merit Scholarship',8000,'annual',N'{"min_gpa":3.8,"need_based":false}',1),
+('Need-Based Excellence Grant',5000,'annual',N'{"min_gpa":2.5,"need_based":true,"max_family_income":60000}',1),
+('STEM Achievement Award',4000,'annual',N'{"min_gpa":3.5,"need_based":false,"majors":["CS","Math","Physics","Biology","Chemistry"]}',1),
+('First-Generation College Award',3500,'annual',N'{"min_gpa":2.8,"need_based":true,"first_gen":true}',1),
+('Dean''s List Scholarship',3000,'per-semester',N'{"min_gpa":3.7,"need_based":false}',1),
+('Women in Computing Fellowship',4500,'annual',N'{"min_gpa":3.3,"need_based":false,"gender":"F","majors":["CS","Data Science","IT"]}',1),
+('International Student Bursary',2500,'per-semester',N'{"min_gpa":3.0,"need_based":true,"international":true}',1),
+('Community Leadership Award',2000,'one-time',N'{"min_gpa":2.5,"need_based":false}',1),
+('Graduate Research Fellowship',7000,'annual',N'{"min_gpa":3.5,"need_based":false,"level":"graduate"}',1),
+('Athletic Achievement Grant',1500,'per-semester',N'{"min_gpa":2.0,"need_based":false,"varsity_athlete":true}',1),
+('Library & Information Science Award',2800,'annual',N'{"min_gpa":3.2,"need_based":false}',1),
+('Diversity & Inclusion Scholarship',3200,'annual',N'{"min_gpa":2.7,"need_based":true}',1),
+('Biomedical Research Grant',6000,'annual',N'{"min_gpa":3.6,"need_based":false,"majors":["Biology","Chemistry","Medicine"]}',1),
+('Entrepreneurship Seed Award',5000,'one-time',N'{"min_gpa":3.0,"need_based":false}',1),
+('Transfer Student Transition Grant',1800,'one-time',N'{"min_gpa":2.5,"need_based":true,"transfer":true}',1),
+('Junior Year Abroad Scholarship',2200,'one-time',N'{"min_gpa":3.1,"need_based":false,"min_year":3}',1),
+('Veteran Education Support Award',4000,'annual',N'{"min_gpa":2.0,"need_based":true,"veteran":true}',1),
+('Arts & Humanities Excellence Prize',2600,'annual',N'{"min_gpa":3.4,"need_based":false}',1),
+('Data Science Innovation Award',5500,'annual',N'{"min_gpa":3.5,"need_based":false,"majors":["CS","Data Science","Statistics"]}',1),
+('Sustainability & Environment Grant',2000,'annual',N'{"min_gpa":2.9,"need_based":false}',1);
+GO
+
+INSERT INTO dbo.departments
+(department_id,parent_id,code,name,level,head_faculty_id,established)
+VALUES
+(1,NULL,'FAC-SCI','Faculty of Science & Engineering',1,NULL,1952),
+(2,NULL,'FAC-ART','Faculty of Arts & Humanities',1,NULL,1948),
+(3,NULL,'FAC-BUS','Faculty of Business',1,NULL,1961),
+(4,NULL,'FAC-MED','Faculty of Medicine & Health',1,NULL,1970),
+(5,NULL,'FAC-SOC','Faculty of Social Sciences',1,NULL,1955),
+(6,1,'CS','Computer Science',2,NULL,1975),
+(7,1,'MATH','Mathematics',2,NULL,1952),
+(8,1,'PHYS','Physics',2,NULL,1952),
+(9,1,'CHEM','Chemistry',2,NULL,1952),
+(10,1,'BIO','Biology',2,NULL,1952),
+(11,2,'ENGL','English & Literature',2,NULL,1948),
+(12,2,'HIST','History',2,NULL,1948),
+(13,2,'PHIL','Philosophy',2,NULL,1962),
+(14,3,'ECON','Economics',2,NULL,1961),
+(15,3,'FINC','Finance',2,NULL,1968),
+(16,3,'MKTG','Marketing',2,NULL,1975),
+(17,4,'MED','Medicine',2,NULL,1970),
+(18,4,'NURS','Nursing',2,NULL,1972),
+(19,5,'PSY','Psychology',2,NULL,1960),
+(20,5,'SOC','Sociology',2,NULL,1955),
+(21,6,'CS-AI','Artificial Intelligence & ML',3,NULL,1998),
+(22,6,'CS-SEC','Cybersecurity & Networks',3,NULL,2003),
+(23,6,'CS-DB','Database & Information Systems',3,NULL,1990),
+(24,7,'MATH-STAT','Statistics & Data Science',3,NULL,2005),
+(25,10,'BIO-GEN','Genetics & Genomics',3,NULL,2010);
+GO
+
+/* ============================================================
+   Generate 250 faculty
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 250
+)
+INSERT INTO dbo.faculty
+(department_id,first_name,last_name,email,phone,rank,hire_date,office,office_hours,bio,is_active)
+SELECT
+    6 + ((n-1) % 15),
+    CASE n % 10
+       WHEN 0 THEN 'Ahmed' WHEN 1 THEN 'Omar' WHEN 2 THEN 'Mona'
+       WHEN 3 THEN 'Sara' WHEN 4 THEN 'Ali' WHEN 5 THEN 'Nour'
+       WHEN 6 THEN 'Youssef' WHEN 7 THEN 'Hana' WHEN 8 THEN 'Adam'
+       ELSE 'Lina' END,
+    CONCAT('Faculty',RIGHT('000'+CAST(n AS VARCHAR(3)),3)),
+    CONCAT('faculty',RIGHT('000'+CAST(n AS VARCHAR(3)),3),'@university.edu'),
+    CONCAT('+20-100-',RIGHT('0000000'+CAST(n AS VARCHAR(7)),7)),
+    CASE n % 5
+       WHEN 0 THEN 'Professor'
+       WHEN 1 THEN 'Associate Professor'
+       WHEN 2 THEN 'Assistant Professor'
+       WHEN 3 THEN 'Instructor'
+       ELSE 'Professor' END,
+    DATEADD(DAY,-((n*73)%9000),CAST('2026-01-01' AS DATE)),
+    CONCAT('OFF-',RIGHT('000'+CAST(n AS VARCHAR(3)),3)),
+    N'[{"day":"Mon","start":"10:00","end":"12:00"},{"day":"Wed","start":"14:00","end":"16:00"}]',
+    CONCAT(N'Academic faculty member number ',n),
+    1
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+UPDATE d
+SET head_faculty_id = d.department_id
+FROM dbo.departments d
+WHERE d.department_id BETWEEN 1 AND 5;
+GO
+
+/* ============================================================
+   Generate 2000 students
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 2000
+)
+INSERT INTO dbo.students
+(department_id,student_number,first_name,last_name,email,date_of_birth,
+ gender,enrollment_date,expected_grad,status,gpa,contacts)
+SELECT
+    6 + ((n-1)%15),
+    CONCAT('S',RIGHT('000000000'+CAST(n AS VARCHAR(9)),9)),
+    CASE n%10
+      WHEN 0 THEN 'Ahmed' WHEN 1 THEN 'Mohamed' WHEN 2 THEN 'Omar'
+      WHEN 3 THEN 'Youssef' WHEN 4 THEN 'Ali' WHEN 5 THEN 'Mariam'
+      WHEN 6 THEN 'Sara' WHEN 7 THEN 'Nour' WHEN 8 THEN 'Hana'
+      ELSE 'Lina' END,
+    CONCAT('Student',RIGHT('0000'+CAST(n AS VARCHAR(4)),4)),
+    CONCAT('student',RIGHT('0000'+CAST(n AS VARCHAR(4)),4),'@university.edu'),
+    DATEADD(DAY,-((n*17)%9000),CAST('2006-01-01' AS DATE)),
+    CASE n%4 WHEN 0 THEN 'M' WHEN 1 THEN 'F' WHEN 2 THEN 'M' ELSE 'F' END,
+    DATEADD(DAY,-((n*11)%2500),CAST('2026-01-01' AS DATE)),
+    CASE n%4 WHEN 0 THEN 2027 WHEN 1 THEN 2028 WHEN 2 THEN 2029 ELSE 2030 END,
+    'active',
+    NULL,
+    CONCAT(N'{"emergency":{"name":"Contact ',n,N'","phone":"+20-100-',RIGHT('0000000'+CAST(n AS VARCHAR(7)),7),N'"},"address":{"city":"Alexandria","country":"Egypt"}}')
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   Generate 200 courses
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 200
+)
+INSERT INTO dbo.courses
+(department_id,code,title,credits,level,description,is_active,embedding)
+SELECT
+    6 + ((n-1)%15),
+    CONCAT('CRS',RIGHT('000'+CAST(n AS VARCHAR(3)),3)),
+    CONCAT('Course ',n,' - ',
+       CASE n%6
+         WHEN 0 THEN 'Data Analysis'
+         WHEN 1 THEN 'Database Systems'
+         WHEN 2 THEN 'Programming'
+         WHEN 3 THEN 'Statistics'
+         WHEN 4 THEN 'Research Methods'
+         ELSE 'Information Systems' END),
+    CASE n%4 WHEN 0 THEN 4 WHEN 1 THEN 3 WHEN 2 THEN 3 ELSE 2 END,
+    CASE WHEN n%20=0 THEN 'graduate' ELSE 'undergraduate' END,
+    CONCAT(N'This is a clean analytical university course description for course ',n,
+           N'. Topics include data analysis, technology, research and academic skills.'),
+    1,
+    NULL
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* 199+ prerequisite rows */
+INSERT INTO dbo.course_prerequisites(course_id,prerequisite_id,is_mandatory)
+SELECT n, n-1, 1
+FROM
+(
+    SELECT TOP (199)
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + 1 AS n
+    FROM sys.all_objects a CROSS JOIN sys.all_objects b
+) X;
+GO
+
+/* ============================================================
+   Generate 800 sections
+   4 sections per course across 20 semesters
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 800
+)
+INSERT INTO dbo.sections
+(course_id,semester_id,faculty_id,room_id,section_number,delivery,max_capacity,status,schedule)
+SELECT
+    ((n-1)%200)+1,
+    ((n-1)%20)+1,
+    ((n-1)%250)+1,
+    ((n-1)%47)+1,
+    ((n-1)/200)+1,
+    CASE n%10 WHEN 0 THEN 'online' WHEN 1 THEN 'hybrid' ELSE 'in-person' END,
+    30,
+    CASE WHEN ((n-1)%20)+1 <= 18 THEN 'completed' ELSE 'open' END,
+    N'[{"day":"Mon","start":"09:00","end":"10:30"},{"day":"Wed","start":"09:00","end":"10:30"}]'
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   Generate 8000 enrollments
+   4 sections per student; unique (student_id, section_id) pairs
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 8000
+)
+INSERT INTO dbo.enrollments(student_id,section_id,status,final_grade,final_score)
+SELECT
+    ((n-1)%2000)+1,
+    ((n-1)/2000)+1,
+    CASE WHEN ((n-1)/2000)+1 <= 3 THEN 'completed' ELSE 'enrolled' END,
+    CASE
+      WHEN ((n-1)/2000)+1 <= 3 THEN
+        CASE ((n*13)%10)
+          WHEN 0 THEN 'A' WHEN 1 THEN 'A-' WHEN 2 THEN 'B+'
+          WHEN 3 THEN 'B' WHEN 4 THEN 'B-' WHEN 5 THEN 'C+'
+          WHEN 6 THEN 'C' WHEN 7 THEN 'C-' WHEN 8 THEN 'D'
+          ELSE 'F' END
+      ELSE NULL END,
+    CASE
+      WHEN ((n-1)/2000)+1 <= 3 THEN CAST(60 + ((n*17)%41) AS DECIMAL(5,2))
+      ELSE NULL END
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   500 scholarship awards
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 500
+)
+INSERT INTO dbo.student_scholarships
+(student_id,scholarship_id,awarded_date,expires_date,amount_awarded,notes)
+SELECT
+    ((n-1)%2000)+1,
+    ((n-1)%20)+1,
+    DATEADD(DAY,-((n*19)%1800),CAST('2026-01-01' AS DATE)),
+    DATEADD(DAY,365,DATEADD(DAY,-((n*19)%1800),CAST('2026-01-01' AS DATE))),
+    s.amount,
+    CONCAT(N'Generated scholarship award #',n)
+FROM N
+JOIN dbo.scholarships s ON s.scholarship_id=((n-1)%20)+1
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   200 research projects
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 200
+)
+INSERT INTO dbo.research_projects
+(department_id,lead_faculty_id,title,abstract,start_date,end_date,status,funding)
+SELECT
+    6+((n-1)%15),
+    ((n-1)%250)+1,
+    CONCAT('Research Project ',n,' - University Analytics'),
+    CONCAT(N'Research project focused on technology, education, analytics and innovation. Project #',n),
+    DATEADD(DAY,-((n*29)%2500),CAST('2026-01-01' AS DATE)),
+    DATEADD(DAY,500,DATEADD(DAY,-((n*29)%2500),CAST('2026-01-01' AS DATE))),
+    CASE n%4 WHEN 0 THEN 'completed' WHEN 1 THEN 'active' WHEN 2 THEN 'proposed' ELSE 'completed' END,
+    CONCAT(N'{"source":"University Research Fund","amount":',10000+n*500,N',"grant_id":"GR-',n,N'"}')
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   500 publications
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 500
+)
+INSERT INTO dbo.publications
+(project_id,title,abstract,pub_year,venue,doi,keywords,citation_count)
+SELECT
+    CASE WHEN n%10=0 THEN NULL ELSE ((n-1)%200)+1 END,
+    CONCAT('University Research Publication ',n),
+    CONCAT(N'Abstract for publication ',n,N'. Research covers data science, AI, databases and education.'),
+    2020+(n%7),
+    CASE n%4 WHEN 0 THEN 'International Journal of Data Science'
+             WHEN 1 THEN 'ACM Conference'
+             WHEN 2 THEN 'IEEE Conference'
+             ELSE 'University Research Journal' END,
+    CASE WHEN n%10=0 THEN NULL ELSE CONCAT('10.1000/uni.',n) END,
+    CASE n%5
+      WHEN 0 THEN 'AI,ML,Data Science'
+      WHEN 1 THEN 'Databases,Systems'
+      WHEN 2 THEN 'Algorithms,Theory'
+      WHEN 3 THEN 'Security,Networking'
+      ELSE 'HCI,Data Science' END,
+    (n*37)%1001
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   900 project members
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 900
+)
+INSERT INTO dbo.project_members
+(project_id,faculty_id,student_id,role,joined_date,left_date)
+SELECT
+    ((n-1)%200)+1,
+    CASE WHEN n%2=0 THEN ((n-1)%250)+1 ELSE NULL END,
+    CASE WHEN n%2=1 THEN ((n-1)%2000)+1 ELSE NULL END,
+    CASE
+      WHEN n%10=0 THEN 'Principal Investigator'
+      WHEN n%2=0 THEN 'Co-Investigator'
+      ELSE 'Research Assistant' END,
+    DATEADD(DAY,-((n*13)%1800),CAST('2026-01-01' AS DATE)),
+    NULL
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   40,000 grade events
+   5 grade items for each enrollment.
+   We intentionally avoid triggers during the bulk seed.
+   ============================================================ */
+;WITH N AS
+(
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM N WHERE n < 40000
+)
+INSERT INTO dbo.grade_events
+(enrollment_id,item_name,item_type,score,max_score,weight,graded_at,grader_id,feedback)
+SELECT
+    ((n-1)/5)+1,
+    CASE ((n-1)%5)+1
+      WHEN 1 THEN 'Assignment 1'
+      WHEN 2 THEN 'Quiz 1'
+      WHEN 3 THEN 'Midterm Exam'
+      WHEN 4 THEN 'Project'
+      ELSE 'Final Exam' END,
+    CASE ((n-1)%5)+1
+      WHEN 1 THEN 'assignment'
+      WHEN 2 THEN 'quiz'
+      WHEN 3 THEN 'midterm'
+      WHEN 4 THEN 'project'
+      ELSE 'final' END,
+    CAST(60+((n*17)%41) AS DECIMAL(6,2)),
+    100,
+    CASE ((n-1)%5)+1
+      WHEN 1 THEN 0.15
+      WHEN 2 THEN 0.10
+      WHEN 3 THEN 0.25
+      WHEN 4 THEN 0.20
+      ELSE 0.30 END,
+    DATEADD(DAY,-(n%1800),CAST('2026-01-01' AS DATETIME2)),
+    ((n-1)%250)+1,
+    CONCAT(N'Generated grade event #',n)
+FROM N
+OPTION (MAXRECURSION 0);
+GO
+
+/* ============================================================
+   Recalculate final scores for enrollments with grade events
+   ============================================================ */
+;WITH G AS
+(
+    SELECT
+        enrollment_id,
+        ROUND(SUM((score/max_score)*weight*100.0),2) AS final_score
+    FROM dbo.grade_events
+    GROUP BY enrollment_id
+)
+UPDATE e
+SET
+    e.final_score = G.final_score,
+    e.final_grade =
+       CASE
+         WHEN G.final_score >= 93 THEN 'A'
+         WHEN G.final_score >= 90 THEN 'A-'
+         WHEN G.final_score >= 87 THEN 'B+'
+         WHEN G.final_score >= 83 THEN 'B'
+         WHEN G.final_score >= 80 THEN 'B-'
+         WHEN G.final_score >= 77 THEN 'C+'
+         WHEN G.final_score >= 73 THEN 'C'
+         WHEN G.final_score >= 70 THEN 'C-'
+         WHEN G.final_score >= 60 THEN 'D'
+         ELSE 'F'
+       END
+FROM dbo.enrollments e
+JOIN G ON G.enrollment_id=e.enrollment_id
+WHERE e.status='completed';
+GO
+
+/* ============================================================
+   Calculate student GPA
+   ============================================================ */
+;WITH G AS
+(
+    SELECT
+       e.student_id,
+       CAST(
+       SUM(
+          CASE e.final_grade
+            WHEN 'A' THEN 4.0
+            WHEN 'A-' THEN 3.7
+            WHEN 'B+' THEN 3.3
+            WHEN 'B' THEN 3.0
+            WHEN 'B-' THEN 2.7
+            WHEN 'C+' THEN 2.3
+            WHEN 'C' THEN 2.0
+            WHEN 'C-' THEN 1.7
+            WHEN 'D' THEN 1.0
+            ELSE 0.0
+          END*c.credits
+       ) / NULLIF(SUM(c.credits),0) AS DECIMAL(4,3)) AS gpa
+    FROM dbo.enrollments e
+    JOIN dbo.sections sec ON sec.section_id=e.section_id
+    JOIN dbo.courses c ON c.course_id=sec.course_id
+    WHERE e.status='completed'
+    GROUP BY e.student_id
+)
+UPDATE s
+SET s.gpa=G.gpa
+FROM dbo.students s
+JOIN G ON G.student_id=s.student_id;
+GO
+
+/* ============================================================
+   TRIGGERS
+   ============================================================ */
+
+/* Capacity validation */
+CREATE TRIGGER dbo.trg_enrollment_capacity
+ON dbo.enrollments
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM dbo.sections sec
+        JOIN
+        (
+            SELECT section_id, COUNT(*) AS enrolled_count
+            FROM dbo.enrollments
+            WHERE status='enrolled'
+            GROUP BY section_id
+        ) x ON x.section_id=sec.section_id
+        WHERE x.enrolled_count > sec.max_capacity
+    )
+    BEGIN
+        ROLLBACK TRANSACTION;
+        THROW 50001, 'Section has reached maximum capacity.', 1;
+    END
+END;
+GO
+
+/* Auto close */
+CREATE TRIGGER dbo.trg_section_auto_close
+ON dbo.enrollments
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE sec
+    SET status='closed'
+    FROM dbo.sections sec
+    WHERE sec.status='open'
+      AND EXISTS
+      (
+        SELECT 1
+        FROM
+        (
+          SELECT section_id,COUNT(*) AS cnt
+          FROM dbo.enrollments
+          WHERE status='enrolled'
+          GROUP BY section_id
+        ) x
+        WHERE x.section_id=sec.section_id
+          AND x.cnt>=sec.max_capacity
+      );
+END;
+GO
+
+/* Enrollment audit */
+CREATE TRIGGER dbo.trg_enrollment_audit
+ON dbo.enrollments
+AFTER INSERT, UPDATE, DELETE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.audit_log
+    (table_name,record_id,action,changed_by,old_values,new_values)
+    SELECT
+        'enrollments',
+        COALESCE(i.enrollment_id,d.enrollment_id),
+        CASE WHEN i.enrollment_id IS NULL THEN 'DELETE'
+             WHEN d.enrollment_id IS NULL THEN 'INSERT'
+             ELSE 'UPDATE' END,
+        SUSER_SNAME(),
+        CASE WHEN d.enrollment_id IS NULL THEN NULL
+             ELSE (SELECT d.student_id,d.section_id,d.status,d.final_grade,d.final_score
+                   FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) END,
+        CASE WHEN i.enrollment_id IS NULL THEN NULL
+             ELSE (SELECT i.student_id,i.section_id,i.status,i.final_grade,i.final_score
+                   FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) END
+    FROM inserted i
+    FULL OUTER JOIN deleted d
+      ON i.enrollment_id=d.enrollment_id;
+END;
+GO
+
+/* Student audit */
+CREATE TRIGGER dbo.trg_student_audit
+ON dbo.students
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.audit_log
+    (table_name,record_id,action,changed_by,old_values,new_values)
+    SELECT
+        'students',
+        i.student_id,
+        'UPDATE',
+        SUSER_SNAME(),
+        (SELECT d.gpa,d.status FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+        (SELECT i.gpa,i.status FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)
+    FROM inserted i
+    JOIN deleted d ON d.student_id=i.student_id
+    WHERE ISNULL(i.gpa,-1)<>ISNULL(d.gpa,-1)
+       OR ISNULL(i.status,'')<>ISNULL(d.status,'');
+END;
+GO
+
+/* Grade audit */
+CREATE TRIGGER dbo.trg_grade_audit
+ON dbo.grade_events
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.audit_log
+    (table_name,record_id,action,changed_by,old_values,new_values)
+    SELECT
+        'grade_events',
+        i.event_id,
+        'INSERT',
+        SUSER_SNAME(),
+        NULL,
+        (SELECT i.enrollment_id,i.item_name,i.item_type,i.score,i.max_score,i.weight
+         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)
+    FROM inserted i;
+END;
+GO
+
+/* ============================================================
+   VIEWS
+   ============================================================ */
+
+CREATE VIEW dbo.v_student_gpa AS
+SELECT
+    s.student_id,
+    s.student_number,
+    CONCAT(s.first_name,' ',s.last_name) AS student_name,
+    sem.semester_id,
+    sem.name AS semester,
+    COUNT(e.enrollment_id) AS courses_taken,
+    ROUND(AVG(e.final_score),2) AS avg_score,
+    ROUND(
+      SUM(
+        CASE e.final_grade
+          WHEN 'A' THEN 4.0*c.credits
+          WHEN 'A-' THEN 3.7*c.credits
+          WHEN 'B+' THEN 3.3*c.credits
+          WHEN 'B' THEN 3.0*c.credits
+          WHEN 'B-' THEN 2.7*c.credits
+          WHEN 'C+' THEN 2.3*c.credits
+          WHEN 'C' THEN 2.0*c.credits
+          WHEN 'C-' THEN 1.7*c.credits
+          WHEN 'D' THEN 1.0*c.credits
+          ELSE 0
+        END
+      ) / NULLIF(SUM(c.credits),0),3
+    ) AS semester_gpa
+FROM dbo.students s
+JOIN dbo.enrollments e ON e.student_id=s.student_id AND e.status='completed'
+JOIN dbo.sections sec ON sec.section_id=e.section_id
+JOIN dbo.semesters sem ON sem.semester_id=sec.semester_id
+JOIN dbo.courses c ON c.course_id=sec.course_id
+GROUP BY s.student_id,s.student_number,s.first_name,s.last_name,sem.semester_id,sem.name;
+GO
+
+CREATE VIEW dbo.v_section_roster AS
+SELECT
+    sec.section_id,
+    c.code AS course_code,
+    c.title AS course_title,
+    sem.name AS semester,
+    CONCAT(f.first_name,' ',f.last_name) AS instructor,
+    s.student_number,
+    CONCAT(s.first_name,' ',s.last_name) AS student_name,
+    s.email AS student_email,
+    e.enrollment_id,
+    e.status AS enrollment_status,
+    e.final_grade
+FROM dbo.sections sec
+JOIN dbo.courses c ON c.course_id=sec.course_id
+JOIN dbo.semesters sem ON sem.semester_id=sec.semester_id
+JOIN dbo.faculty f ON f.faculty_id=sec.faculty_id
+JOIN dbo.enrollments e ON e.section_id=sec.section_id
+JOIN dbo.students s ON s.student_id=e.student_id;
+GO
+
+CREATE VIEW dbo.v_course_pass_rate AS
+SELECT
+    c.course_id,
+    c.code,
+    c.title,
+    d.name AS department,
+    COUNT(e.enrollment_id) AS total_enrollments,
+    SUM(CASE WHEN e.status='completed' THEN 1 ELSE 0 END) AS completed,
+    SUM(CASE WHEN e.status='failed' THEN 1 ELSE 0 END) AS failed,
+    SUM(CASE WHEN e.status='dropped' THEN 1 ELSE 0 END) AS dropped,
+    ROUND(
+      100.0*SUM(CASE WHEN e.status='completed' THEN 1 ELSE 0 END)
+      / NULLIF(COUNT(e.enrollment_id),0),1
+    ) AS pass_rate_pct,
+    ROUND(AVG(e.final_score),2) AS avg_final_score
+FROM dbo.courses c
+JOIN dbo.departments d ON d.department_id=c.department_id
+LEFT JOIN dbo.sections sec ON sec.course_id=c.course_id
+LEFT JOIN dbo.enrollments e ON e.section_id=sec.section_id
+GROUP BY c.course_id,c.code,c.title,d.name;
+GO
+
+CREATE VIEW dbo.v_faculty_workload AS
+SELECT
+    f.faculty_id,
+    CONCAT(f.first_name,' ',f.last_name) AS faculty_name,
+    f.rank,
+    d.name AS department,
+    COUNT(DISTINCT sec.section_id) AS sections_taught,
+    SUM(sec.max_capacity) AS total_capacity,
+    COUNT(e.enrollment_id) AS total_students_enrolled,
+    ROUND(
+      100.0*COUNT(e.enrollment_id)
+      / NULLIF(SUM(sec.max_capacity),0),1
+    ) AS avg_fill_rate_pct
+FROM dbo.faculty f
+JOIN dbo.departments d ON d.department_id=f.department_id
+LEFT JOIN dbo.sections sec ON sec.faculty_id=f.faculty_id
+LEFT JOIN dbo.enrollments e ON e.section_id=sec.section_id
+AND e.status IN ('enrolled','completed','failed')
+GROUP BY f.faculty_id,f.first_name,f.last_name,f.rank,d.name;
+GO
+
+CREATE VIEW dbo.v_top_scholars AS
+SELECT
+    s.student_id,
+    s.student_number,
+    CONCAT(s.first_name,' ',s.last_name) AS student_name,
+    d.name AS department,
+    COUNT(ss.award_id) AS scholarship_count,
+    SUM(ss.amount_awarded) AS total_awarded,
+    STRING_AGG(sc.name,'; ') AS scholarships
+FROM dbo.students s
+JOIN dbo.departments d ON d.department_id=s.department_id
+JOIN dbo.student_scholarships ss ON ss.student_id=s.student_id
+JOIN dbo.scholarships sc ON sc.scholarship_id=ss.scholarship_id
+GROUP BY s.student_id,s.student_number,s.first_name,s.last_name,d.name;
+GO
+
+CREATE VIEW dbo.v_publication_stats AS
+SELECT
+    d.name AS department,
+    p.pub_year,
+    COUNT(p.publication_id) AS paper_count,
+    SUM(p.citation_count) AS total_citations,
+    ROUND(AVG(CAST(p.citation_count AS DECIMAL(18,2))),1) AS avg_citations
+FROM dbo.publications p
+LEFT JOIN dbo.research_projects rp ON rp.project_id=p.project_id
+LEFT JOIN dbo.departments d ON d.department_id=rp.department_id
+GROUP BY d.name,p.pub_year;
+GO
+
+CREATE VIEW dbo.v_prerequisite_tree AS
+SELECT
+    c.code AS course_code,
+    c.title AS course_title,
+    p.code AS prerequisite_code,
+    p.title AS prerequisite_title,
+    cp.is_mandatory
+FROM dbo.course_prerequisites cp
+JOIN dbo.courses c ON c.course_id=cp.course_id
+JOIN dbo.courses p ON p.course_id=cp.prerequisite_id;
+GO
+
+/* ============================================================
+   STORED PROCEDURES
+   ============================================================ */
+
+CREATE PROCEDURE dbo.sp_enroll_student
+    @p_student_id INT,
+    @p_section_id INT,
+    @p_enrollment_id INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @status VARCHAR(20), @course_id SMALLINT, @missing VARCHAR(150);
+
+    SELECT @status=status,@course_id=course_id
+    FROM dbo.sections
+    WHERE section_id=@p_section_id;
+
+    IF @status IS NULL
+        THROW 50010,'Section not found',1;
+
+    IF @status<>'open'
+        THROW 50011,'Section is not open for enrollment',1;
+
+    IF EXISTS
+    (
+      SELECT 1 FROM dbo.enrollments
+      WHERE student_id=@p_student_id
+        AND section_id=@p_section_id
+        AND status<>'dropped'
+    )
+        THROW 50012,'Student is already enrolled in this section',1;
+
+    SELECT TOP (1) @missing=c.title
+    FROM dbo.course_prerequisites cp
+    JOIN dbo.courses c ON c.course_id=cp.prerequisite_id
+    WHERE cp.course_id=@course_id
+      AND cp.is_mandatory=1
+      AND NOT EXISTS
+      (
+        SELECT 1
+        FROM dbo.enrollments e
+        JOIN dbo.sections s ON s.section_id=e.section_id
+        WHERE e.student_id=@p_student_id
+          AND s.course_id=cp.prerequisite_id
+          AND e.status='completed'
+      );
+
+    IF @missing IS NOT NULL
+    BEGIN
+        DECLARE @msg NVARCHAR(2048)=CONCAT('Missing prerequisite: ',@missing);
+        THROW 50013,@msg,1;
+    END
+
+    INSERT INTO dbo.enrollments(student_id,section_id,status)
+    VALUES(@p_student_id,@p_section_id,'enrolled');
+
+    SET @p_enrollment_id=CONVERT(INT,SCOPE_IDENTITY());
+END;
+GO
+
+CREATE PROCEDURE dbo.sp_drop_enrollment
+    @p_enrollment_id INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @section_id INT,@current_status VARCHAR(20);
+
+    SELECT @section_id=section_id,@current_status=status
+    FROM dbo.enrollments
+    WHERE enrollment_id=@p_enrollment_id;
+
+    IF @current_status IS NULL
+        THROW 50020,'Enrollment not found',1;
+
+    IF @current_status<>'enrolled'
+        THROW 50021,'Only active enrollments can be dropped',1;
+
+    UPDATE dbo.enrollments
+    SET status='dropped'
+    WHERE enrollment_id=@p_enrollment_id;
+
+    UPDATE sec
+    SET status='open'
+    FROM dbo.sections sec
+    WHERE sec.section_id=@section_id
+      AND sec.status='closed'
+      AND
+      (
+        SELECT COUNT(*)
+        FROM dbo.enrollments e
+        WHERE e.section_id=@section_id
+          AND e.status='enrolled'
+      )<sec.max_capacity;
+END;
+GO
+
+CREATE PROCEDURE dbo.sp_submit_grade
+    @p_enrollment_id INT,
+    @p_item_name VARCHAR(100),
+    @p_item_type VARCHAR(20),
+    @p_score DECIMAL(6,2),
+    @p_max_score DECIMAL(6,2),
+    @p_weight DECIMAL(5,4),
+    @p_grader_id SMALLINT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.grade_events
+    (enrollment_id,item_name,item_type,score,max_score,weight,graded_at,grader_id)
+    VALUES
+    (@p_enrollment_id,@p_item_name,@p_item_type,@p_score,@p_max_score,@p_weight,SYSDATETIME(),@p_grader_id);
+
+    DECLARE @weighted DECIMAL(8,4);
+
+    SELECT @weighted=SUM((score/max_score)*weight*100.0)
+    FROM dbo.grade_events
+    WHERE enrollment_id=@p_enrollment_id;
+
+    UPDATE dbo.enrollments
+    SET final_score=ROUND(@weighted,2),
+        final_grade=CASE
+          WHEN @weighted>=93 THEN 'A'
+          WHEN @weighted>=90 THEN 'A-'
+          WHEN @weighted>=87 THEN 'B+'
+          WHEN @weighted>=83 THEN 'B'
+          WHEN @weighted>=80 THEN 'B-'
+          WHEN @weighted>=77 THEN 'C+'
+          WHEN @weighted>=73 THEN 'C'
+          WHEN @weighted>=70 THEN 'C-'
+          WHEN @weighted>=60 THEN 'D'
+          ELSE 'F' END,
+        status=CASE
+          WHEN @p_item_type='final' AND @weighted>=60 THEN 'completed'
+          WHEN @p_item_type='final' AND @weighted<60 THEN 'failed'
+          ELSE status END
+    WHERE enrollment_id=@p_enrollment_id;
+END;
+GO
+
+CREATE PROCEDURE dbo.sp_calculate_gpa
+    @p_student_id INT,
+    @p_gpa DECIMAL(4,3) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT @p_gpa=
+      ROUND(
+        SUM(
+          CASE e.final_grade
+            WHEN 'A' THEN 4.0
+            WHEN 'A-' THEN 3.7
+            WHEN 'B+' THEN 3.3
+            WHEN 'B' THEN 3.0
+            WHEN 'B-' THEN 2.7
+            WHEN 'C+' THEN 2.3
+            WHEN 'C' THEN 2.0
+            WHEN 'C-' THEN 1.7
+            WHEN 'D' THEN 1.0
+            ELSE 0 END*c.credits
+        )/NULLIF(SUM(c.credits),0),3)
+    FROM dbo.enrollments e
+    JOIN dbo.sections sec ON sec.section_id=e.section_id
+    JOIN dbo.courses c ON c.course_id=sec.course_id
+    WHERE e.student_id=@p_student_id
+      AND e.status='completed';
+
+    UPDATE dbo.students
+    SET gpa=@p_gpa
+    WHERE student_id=@p_student_id;
+END;
+GO
+
+CREATE PROCEDURE dbo.sp_get_prerequisite_chain
+    @p_course_id SMALLINT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    WITH prereq_tree AS
+    (
+      SELECT
+        cp.course_id,
+        cp.prerequisite_id,
+        c.code AS course_code,
+        p.code AS prereq_code,
+        p.title AS prereq_title,
+        cp.is_mandatory,
+        1 AS depth
+      FROM dbo.course_prerequisites cp
+      JOIN dbo.courses c ON c.course_id=cp.course_id
+      JOIN dbo.courses p ON p.course_id=cp.prerequisite_id
+      WHERE cp.course_id=@p_course_id
+
+      UNION ALL
+
+      SELECT
+        cp2.course_id,
+        cp2.prerequisite_id,
+        c2.code,
+        p2.code,
+        p2.title,
+        cp2.is_mandatory,
+        pt.depth+1
+      FROM dbo.course_prerequisites cp2
+      JOIN prereq_tree pt ON pt.prerequisite_id=cp2.course_id
+      JOIN dbo.courses c2 ON c2.course_id=cp2.course_id
+      JOIN dbo.courses p2 ON p2.course_id=cp2.prerequisite_id
+      WHERE pt.depth<10
+    )
+    SELECT DISTINCT depth,prereq_code,prereq_title,is_mandatory
+    FROM prereq_tree
+    ORDER BY depth,prereq_code
+    OPTION (MAXRECURSION 10);
+END;
+GO
+
+/* SQL Server-compatible replacement for MariaDB vector search.
+   It searches course title/description using a keyword. */
+CREATE PROCEDURE dbo.sp_search_courses_semantic
+    @p_search_term NVARCHAR(200),
+    @p_limit INT = 10
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT TOP (@p_limit)
+        c.course_id,
+        c.code,
+        c.title,
+        c.credits,
+        d.name AS department,
+        CASE
+          WHEN c.title LIKE N'%'+@p_search_term+N'%' THEN 0
+          ELSE 1
+        END AS distance
+    FROM dbo.courses c
+    JOIN dbo.departments d ON d.department_id=c.department_id
+    WHERE c.is_active=1
+      AND
+      (
+        c.title LIKE N'%'+@p_search_term+N'%'
+        OR c.description LIKE N'%'+@p_search_term+N'%'
+      )
+    ORDER BY distance,c.code;
+END;
+GO
+
+/* ============================================================
+   INDEXES FOR ANALYSIS / POWER BI
+   ============================================================ */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_students_department' AND object_id=OBJECT_ID(N'dbo.students')) CREATE INDEX IX_students_department ON dbo.students(department_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_students_status' AND object_id=OBJECT_ID(N'dbo.students')) CREATE INDEX IX_students_status ON dbo.students(status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_faculty_department' AND object_id=OBJECT_ID(N'dbo.faculty')) CREATE INDEX IX_faculty_department ON dbo.faculty(department_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_courses_department' AND object_id=OBJECT_ID(N'dbo.courses')) CREATE INDEX IX_courses_department ON dbo.courses(department_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_sections_semester' AND object_id=OBJECT_ID(N'dbo.sections')) CREATE INDEX IX_sections_semester ON dbo.sections(semester_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_sections_faculty' AND object_id=OBJECT_ID(N'dbo.sections')) CREATE INDEX IX_sections_faculty ON dbo.sections(faculty_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_enrollments_section' AND object_id=OBJECT_ID(N'dbo.enrollments')) CREATE INDEX IX_enrollments_section ON dbo.enrollments(section_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_enrollments_student' AND object_id=OBJECT_ID(N'dbo.enrollments')) CREATE INDEX IX_enrollments_student ON dbo.enrollments(student_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_grade_events_enrollment' AND object_id=OBJECT_ID(N'dbo.grade_events')) CREATE INDEX IX_grade_events_enrollment ON dbo.grade_events(enrollment_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_grade_events_date' AND object_id=OBJECT_ID(N'dbo.grade_events')) CREATE INDEX IX_grade_events_date ON dbo.grade_events(graded_at);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name=N'IX_publications_year' AND object_id=OBJECT_ID(N'dbo.publications')) CREATE INDEX IX_publications_year ON dbo.publications(pub_year);
+GO
+
+/* ============================================================
+   FINAL CHECK
+   ============================================================ */
+SELECT 'semesters' AS table_name, COUNT(*) AS row_count FROM dbo.semesters
+UNION ALL SELECT 'rooms',COUNT(*) FROM dbo.rooms
+UNION ALL SELECT 'scholarships',COUNT(*) FROM dbo.scholarships
+UNION ALL SELECT 'departments',COUNT(*) FROM dbo.departments
+UNION ALL SELECT 'faculty',COUNT(*) FROM dbo.faculty
+UNION ALL SELECT 'students',COUNT(*) FROM dbo.students
+UNION ALL SELECT 'courses',COUNT(*) FROM dbo.courses
+UNION ALL SELECT 'course_prerequisites',COUNT(*) FROM dbo.course_prerequisites
+UNION ALL SELECT 'sections',COUNT(*) FROM dbo.sections
+UNION ALL SELECT 'enrollments',COUNT(*) FROM dbo.enrollments
+UNION ALL SELECT 'student_scholarships',COUNT(*) FROM dbo.student_scholarships
+UNION ALL SELECT 'research_projects',COUNT(*) FROM dbo.research_projects
+UNION ALL SELECT 'publications',COUNT(*) FROM dbo.publications
+UNION ALL SELECT 'project_members',COUNT(*) FROM dbo.project_members
+UNION ALL SELECT 'grade_events',COUNT(*) FROM dbo.grade_events
+UNION ALL SELECT 'audit_log',COUNT(*) FROM dbo.audit_log;
+GO

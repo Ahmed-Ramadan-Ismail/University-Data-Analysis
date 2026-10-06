@@ -1,0 +1,211 @@
+USE university;
+GO
+
+SELECT 
+    TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE = 'BASE TABLE'
+ORDER BY TABLE_NAME;
+
+USE university;
+GO
+
+SELECT *
+FROM students AS S;
+
+-- drop tables that are not needed for the analysis
+
+DROP TABLE IF EXISTS dbo.audit_log;
+DROP TABLE IF EXISTS dbo.grade_events;
+DROP TABLE IF EXISTS dbo.project_members;
+DROP TABLE IF EXISTS dbo.publications;
+DROP TABLE IF EXISTS dbo.research_projects;
+DROP TABLE IF EXISTS dbo.course_prerequisites;
+
+
+
+-- student number
+SELECT COUNT(*) AS student_number
+FROM dbo.students AS S;
+
+
+-- student number in each department
+SELECT D.name AS department_name,
+COUNT(S.student_id) AS student_number
+FROM dbo.students AS S
+JOIN dbo.departments AS D
+ON S.department_id = D.department_id
+GROUP BY D.name
+ORDER BY student_number DESC;
+
+
+-- average GPA for students
+SELECT AVG(S.gpa) AS average_gpa
+FROM dbo.students AS S;
+
+
+-- top 10 students by GPA
+SELECT TOP 10 S.student_id, S.first_name, S.last_name, S.gpa
+FROM dbo.students AS S
+ORDER BY S.gpa DESC;
+
+
+-- student number by status
+SELECT S.status,
+COUNT(*) AS student_number
+FROM dbo.students AS S
+GROUP BY S.status
+ORDER BY student_number DESC;
+
+
+-- course number in each department
+SELECT D.name AS department_name,
+COUNT(C.course_id) AS course_number
+FROM dbo.courses AS C
+JOIN dbo.departments AS D
+ON C.department_id = D.department_id
+GROUP BY D.name
+ORDER BY course_number DESC;
+
+
+-- average final score for each course
+SELECT C.title AS course_title,
+AVG(E.final_score) AS average_final_score
+FROM dbo.enrollments AS E
+JOIN dbo.sections AS SE
+ON E.section_id = SE.section_id
+JOIN dbo.courses AS C
+ON SE.course_id = C.course_id
+GROUP BY C.title
+ORDER BY average_final_score DESC;
+
+
+
+-- faculty with the highest number of sections
+SELECT TOP 10 F.faculty_id, F.first_name, F.last_name,
+COUNT(SE.section_id) AS section_number
+FROM dbo.faculty AS F
+JOIN dbo.sections AS SE
+ON F.faculty_id = SE.faculty_id
+GROUP BY F.faculty_id, F.first_name, F.last_name
+ORDER BY section_number DESC;
+
+
+-- total scholarship value for each student
+SELECT S.student_id, S.first_name, S.last_name,
+SUM(SC.amount) AS total_scholarship
+FROM dbo.students AS S
+JOIN dbo.student_scholarships AS SS
+ON S.student_id = SS.student_id
+JOIN dbo.scholarships AS SC
+ON SS.scholarship_id = SC.scholarship_id
+GROUP BY S.student_id, S.first_name, S.last_name
+ORDER BY total_scholarship DESC;
+
+
+-- top 10 scholarships by student number
+SELECT TOP 10 SC.name AS scholarship_name,
+COUNT(SS.student_id) AS student_number
+FROM dbo.scholarships AS SC
+JOIN dbo.student_scholarships AS SS
+ON SC.scholarship_id = SS.scholarship_id
+GROUP BY SC.name
+ORDER BY student_number DESC;
+
+
+-- student number by enrollment status
+SELECT E.status,
+COUNT(*) AS student_number
+FROM dbo.enrollments AS E
+GROUP BY E.status
+ORDER BY student_number DESC;
+
+
+-- average final score by department
+SELECT D.name AS department_name,
+AVG(E.final_score) AS average_final_score
+FROM dbo.enrollments AS E
+JOIN dbo.sections AS SE
+ON E.section_id = SE.section_id
+JOIN dbo.courses AS C
+ON SE.course_id = C.course_id
+JOIN dbo.departments AS D
+ON C.department_id = D.department_id
+GROUP BY D.name
+ORDER BY average_final_score DESC;
+
+
+-- student enrollment number
+SELECT S.student_id, S.first_name, S.last_name,
+COUNT(E.section_id) AS enrollment_number
+FROM dbo.students AS S
+LEFT JOIN dbo.enrollments AS E
+ON S.student_id = E.student_id
+GROUP BY S.student_id, S.first_name, S.last_name
+ORDER BY enrollment_number DESC;
+
+Go
+
+-- create unified view
+--CREATE VIEW dbo.U_S
+--AS
+SELECT
+S.student_id,
+S.first_name AS student_first_name,
+S.last_name AS student_last_name,
+S.gpa,
+S.status AS student_status,
+
+D.department_id,
+D.name AS department_name,
+
+E.enrollment_id,
+E.enrolled_at,
+E.status AS enrollment_status,
+E.final_grade,
+E.final_score,
+
+SE.section_id,
+SE.semester_id,
+SE.faculty_id,
+SE.room_id,
+
+C.course_id,
+C.code AS course_code,
+C.title AS course_title,
+C.credits,
+C.level,
+
+F.first_name AS faculty_first_name,
+F.last_name AS faculty_last_name,
+
+SC.scholarship_id,
+SC.name AS scholarship_name,
+SC.amount AS scholarship_amount
+
+FROM dbo.students AS S
+
+LEFT JOIN dbo.departments AS D
+ON S.department_id = D.department_id
+
+LEFT JOIN dbo.enrollments AS E
+ON S.student_id = E.student_id
+
+LEFT JOIN dbo.sections AS SE
+ON E.section_id = SE.section_id
+
+LEFT JOIN dbo.courses AS C
+ON SE.course_id = C.course_id
+
+LEFT JOIN dbo.faculty AS F
+ON SE.faculty_id = F.faculty_id
+
+LEFT JOIN dbo.student_scholarships AS SS
+ON S.student_id = SS.student_id
+
+LEFT JOIN dbo.scholarships AS SC
+ON SS.scholarship_id = SC.scholarship_id;
+
+
+Select *
+from U_S
